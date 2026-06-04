@@ -31,6 +31,30 @@ waterfall_rows = 200
 # Spektrum güncelleme hedefi (FPS) — bilgilendirme amaçlı
 target_fps = 30
 
+[doa]
+# İki anten arası mesafe (m). λ/2 aliasing sınırı: 433 MHz'de ≈ 0.346 m.
+# d ≤ λ/2 olmalı; aksi halde faz sarması nedeniyle açı belirsizdir.
+baseline_m = 0.15
+
+[motor]
+# Motor kontrolcüsü seri portu ve hızı (gerçek donanım için).
+port = "/dev/ttyUSB0"
+baudrate = 115200
+
+[scan]
+# Stop-and-measure tarama açı aralığı ve adımı (derece).
+start_deg = 0.0
+stop_deg = 180.0
+step_deg = 10.0
+
+[mock]
+# MockSDR çift kanal (DF) ground-truth: kalibrasyon ve DoA testleri için.
+# Donanımsal kanal uyumsuzluğu (kalibrasyonun ölçüp gidereceği):
+df_sample_shift = 3
+df_phase_offset_rad = 0.6
+# Baskın kaynağın gerçek geliş açısı (derece) — DoA'nın geri çıkaracağı değer.
+df_true_doa_deg = 25.0
+
 [limits]
 # Yazılımsal TX güç üst limiti (dB) — bu iskelette kullanılmaz, ileride ET için
 tx_power_max_db = 0.0

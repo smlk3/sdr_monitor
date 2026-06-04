@@ -13,6 +13,7 @@ import tomllib
 from pathlib import Path
 
 from .hal.mock_sdr import MockSDR
+from .hal.motor import MockMotor, MotorBase
 from .hal.sdr_base import SDRBase
 
 # Varsayılan config yolu: paket kökünden iki üst (repo) / config / default.toml
@@ -27,18 +28,41 @@ def _load_config(path: Path) -> dict:
         return tomllib.load(f)
 
 
-def _build_sdr(use_mock: bool, sdr_cfg: dict) -> SDRBase:
+def _build_sdr(
+    use_mock: bool, sdr_cfg: dict, doa_cfg: dict, mock_cfg: dict
+) -> SDRBase:
     """Bayrağa göre MockSDR veya LimeSDR örneği üret."""
     freq = float(sdr_cfg.get("frequency", 433.0e6))
     rate = float(sdr_cfg.get("sample_rate", 10.0e6))
     gain = float(sdr_cfg.get("gain", 30.0))
     if use_mock:
-        return MockSDR(frequency=freq, sample_rate=rate, gain_db=gain)
+        # DF için çift kanal ground-truth'u config'ten geçir.
+        return MockSDR(
+            frequency=freq,
+            sample_rate=rate,
+            gain_db=gain,
+            df_sample_shift=int(mock_cfg.get("df_sample_shift", 3)),
+            df_phase_offset_rad=float(mock_cfg.get("df_phase_offset_rad", 0.6)),
+            df_true_doa_deg=float(mock_cfg.get("df_true_doa_deg", 25.0)),
+            df_baseline_m=float(doa_cfg.get("baseline_m", 0.15)),
+        )
     # Gerçek donanım: import burada yapılır ki --mock yolunda SoapySDR şart olmasın.
     from .hal.lime_sdr import LimeSDR
 
     channel = int(sdr_cfg.get("channel", 0))
     return LimeSDR(frequency=freq, sample_rate=rate, gain_db=gain, channel=channel)
+
+
+def _build_motor(use_mock: bool, motor_cfg: dict) -> MotorBase:
+    """Bayrağa göre MockMotor veya SerialMotor örneği üret."""
+    if use_mock:
+        return MockMotor()
+    from .hal.motor import SerialMotor
+
+    return SerialMotor(
+        port=str(motor_cfg.get("port", "/dev/ttyUSB0")),
+        baudrate=int(motor_cfg.get("baudrate", 115200)),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -58,8 +82,13 @@ def main(argv: list[str] | None = None) -> int:
     sdr_cfg = cfg.get("sdr", {})
     dsp_cfg = cfg.get("dsp", {})
     ui_cfg = cfg.get("ui", {})
+    doa_cfg = cfg.get("doa", {})
+    motor_cfg = cfg.get("motor", {})
+    scan_cfg = cfg.get("scan", {})
+    mock_cfg = cfg.get("mock", {})
 
-    sdr = _build_sdr(args.mock, sdr_cfg)
+    sdr = _build_sdr(args.mock, sdr_cfg, doa_cfg, mock_cfg)
+    motor = _build_motor(args.mock, motor_cfg)
 
     # Qt importları burada (testlerin başsız import edebilmesi için tembel).
     from PySide6.QtWidgets import QApplication
@@ -79,6 +108,11 @@ def main(argv: list[str] | None = None) -> int:
         num_train=int(dsp_cfg.get("cfar_num_train", 16)),
         num_guard=int(dsp_cfg.get("cfar_num_guard", 4)),
         pfa_exp=int(dsp_cfg.get("cfar_pfa_exp", 4)),
+        motor=motor,
+        baseline_m=float(doa_cfg.get("baseline_m", 0.15)),
+        scan_start_deg=float(scan_cfg.get("start_deg", 0.0)),
+        scan_stop_deg=float(scan_cfg.get("stop_deg", 180.0)),
+        scan_step_deg=float(scan_cfg.get("step_deg", 10.0)),
     )
     win.show()
     win.start()

@@ -48,6 +48,19 @@ class SDRBase(ABC):
         Dönüş: ``numpy.complex64`` türünde, uzunluğu ``n`` olan dizi.
         """
 
+    def read_samples_dual(self, n: int) -> tuple[np.ndarray, np.ndarray]:
+        """İki RX kanalından EŞ ZAMANLI ``n`` IQ örneği oku (koherent).
+
+        Yön bulma (DF) faz interferometrisi için iki kanal aynı anda
+        örneklenmelidir. Varsayılan uygulama desteklenmediğini bildirir; çift
+        kanal sunan alt sınıflar (MockSDR, iki kanallı LimeSDR) bunu gerçekler.
+
+        Dönüş: ``(rx0, rx1)`` — her biri ``complex64``, uzunluğu ``n``.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} çift kanal (DF) okumayı desteklemiyor."
+        )
+
     # --- Bilgi erişimcileri (alt sınıflar geçerli değerleri tutar) ---
 
     @property

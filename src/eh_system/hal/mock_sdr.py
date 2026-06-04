@@ -42,6 +42,23 @@ _QPSK_RRC_BETA = 0.35          # RRC rolloff faktörü
 _QPSK_RRC_SPAN = 8            # RRC filtre uzunluğu (sembol)
 _NOISE_SIGMA = 0.05            # AWGN standart sapması (IQ başına)
 
+# --- İki kanallı (DF) ground-truth varsayılanları ---
+# Işık hızı (m/s) — geometrik faz hesabı için.
+_C = 299_792_458.0
+# İkinci kanalın birinciye göre DONANIMSAL uyumsuzluğu (kalibrasyon hedefi):
+# sabit örnek kayması + sabit faz farkı. "Kalibre" bunları ölçüp giderir.
+_DF_SAMPLE_SHIFT = 3           # örnek kayması (ADC/kablo gecikmesi taklidi)
+_DF_PHASE_OFFSET_RAD = 0.6     # sabit faz farkı (rad)
+# Baskın kaynağın GERÇEK geliş açısı (derece) — kalibrasyon sonrası DoA'nın
+# geri çıkarması beklenen değer. Geometrik faz = 2π·d·sin(θ)·f/c.
+_DF_TRUE_DOA_DEG = 25.0
+# İki anten arası varsayılan mesafe (m). 433 MHz'de λ/2 ≈ 0.346 m > 0.15 (güvenli).
+_DF_BASELINE_M = 0.15
+# Yönlü anten huzme genişliği (Gaussian σ, derece) — tarama açı-güç haritasında
+# kaynak yönünde belirgin bir lob oluşması için. Motor yönü kaynaktan uzaklaştıkça
+# alınan SİNYAL gücü düşer (gürültü sabit kalır → SNR düşer).
+_DF_BEAMWIDTH_SIGMA_DEG = 35.0
+
 
 def _rrc_taps(beta: float, sps: int, span: int) -> np.ndarray:
     """Kök-yükseltilmiş-kosinüs (RRC) filtre katsayıları (enerjiye normalize).
@@ -78,6 +95,10 @@ class MockSDR(SDRBase):
         frequency: float = 433.0e6,
         sample_rate: float = 10.0e6,
         gain_db: float = 30.0,
+        df_sample_shift: int = _DF_SAMPLE_SHIFT,
+        df_phase_offset_rad: float = _DF_PHASE_OFFSET_RAD,
+        df_true_doa_deg: float = _DF_TRUE_DOA_DEG,
+        df_baseline_m: float = _DF_BASELINE_M,
     ) -> None:
         self._freq = float(frequency)
         self._rate = float(sample_rate)
@@ -85,6 +106,18 @@ class MockSDR(SDRBase):
         self._opened = False
         self._phase = 0.0  # örnek blokları arasında faz sürekliliği
         self._rng = np.random.default_rng()
+        # İki kanallı (DF) ground-truth parametreleri.
+        self._df_sample_shift = int(df_sample_shift)
+        self._df_phase_offset_rad = float(df_phase_offset_rad)
+        self._df_true_doa_deg = float(df_true_doa_deg)
+        self._df_baseline_m = float(df_baseline_m)
+        # Kalibrasyon referans modu: True iken ikinci kanala SADECE donanımsal
+        # uyumsuzluk (faz+kayma) konur, geometrik (yön) faz konmaz — broadside
+        # referans kaynağı taklidi. "Kalibre" sırasında worker bunu açar.
+        self._cal_reference = False
+        # Motor (anten) yönelim açısı (derece) — tarama sırasında worker ayarlar.
+        # None iken yönlü kazanç uygulanmaz (gücün 1.0; canlı spektrum etkilenmez).
+        self._pointing_deg: float | None = None
 
     # --- Yaşam döngüsü ---
 
@@ -113,24 +146,46 @@ class MockSDR(SDRBase):
     def sample_rate(self) -> float:
         return self._rate
 
+    def set_calibration_reference(self, on: bool) -> None:
+        """Kalibrasyon referans modunu aç/kapat (yalnızca MockSDR).
+
+        Açıkken ``read_samples_dual`` ikinci kanala SADECE donanımsal uyumsuzluk
+        koyar (geometrik yön fazı yok) — broadside referans kaynağı taklidi.
+        Böylece "Kalibre" donanımsal kaymayı/fazı izole edip ölçebilir; gerçek
+        ölçümde (kapalı) kalan geometrik faz DoA olarak geri çıkar.
+        """
+        self._cal_reference = bool(on)
+
+    def set_pointing_angle(self, deg: float | None) -> None:
+        """Anten yönelim açısını ayarla (yalnızca MockSDR; tarama için).
+
+        Yön bulma taraması her açıda bunu ayarlar; mock, kaynak yönüne
+        (``df_true_doa_deg``) uzaklığa göre sinyal gücünü Gaussian huzme ile
+        ölçekler → kutupsal açı-güç haritasında belirgin bir lob. ``None`` iken
+        yönlü kazanç uygulanmaz (canlı spektrum etkilenmez).
+        """
+        self._pointing_deg = None if deg is None else float(deg)
+
+    def _antenna_gain(self) -> float:
+        """Yönelim açısına göre doğrusal anten kazancı (0..1)."""
+        if self._pointing_deg is None:
+            return 1.0
+        # Kaynağa açısal uzaklığı [-180, 180]'e sar.
+        diff = (self._pointing_deg - self._df_true_doa_deg + 180.0) % 360.0 - 180.0
+        return float(np.exp(-0.5 * (diff / _DF_BEAMWIDTH_SIGMA_DEG) ** 2))
+
     # --- Üretim ---
 
-    def read_samples(self, n: int) -> np.ndarray:
-        """``n`` örneklik sentetik IQ bloğu üret.
+    def _generate_clean(self, n: int) -> np.ndarray:
+        """``n`` örneklik gürültüsüz, kazanç ölçekli sentetik IQ üret.
 
-        Gerçek donanım okuma süresini taklit etmek için kısa bir uyku eklenir,
-        böylece worker CPU'yu %100 meşgul etmez ve FPS gerçekçi kalır.
+        Faz sürekliliği için örnek sayacını (``self._phase``) ilerletir.
         """
-        if not self._opened:
-            raise RuntimeError("MockSDR açık değil; önce open() çağırın.")
-
         rate = self._rate
         t = (np.arange(n, dtype=np.float64) + self._phase) / rate
-
         iq = np.zeros(n, dtype=np.complex128)
 
-        # Kazancı doğrusal bir ölçeğe çevir (görsel olarak kazancın etkisini
-        # spektrumda görmek için). Referans 30 dB.
+        # Kazancı doğrusal bir ölçeğe çevir (referans 30 dB).
         gain_lin = 10.0 ** ((self._gain - 30.0) / 20.0)
 
         # CW taşıyıcılar — baseband ofset frekansları örnekleme hızına oranlı.
@@ -140,20 +195,15 @@ class MockSDR(SDRBase):
             iq += amp * np.exp(2j * np.pi * f_off * t)
 
         # Dar bant FM: sinüzoidal mesajla SINIRLI sapmalı, sabit zarflı FM.
-        # Faz, sürekli küresel zaman ``t`` üzerinden üretildiğinden bloklar
-        # arasında kendiliğinden süreklidir (ayrı faz takibi gerekmez).
         f_center = _NBFM_OFFSET_FRAC * nyq
         f_msg = _NBFM_MSG_FREQ_FRAC * rate
         dev = _NBFM_DEV_FRAC * rate
-        # FM faz: integral(2π·dev·cos) = (dev/f_msg)·sin → sınırlı modülasyon.
         nbfm_inst_phase = 2.0 * np.pi * f_center * t + (dev / f_msg) * np.sin(
             2.0 * np.pi * f_msg * t
         )
         iq += _NBFM_AMPLITUDE * np.exp(1j * nbfm_inst_phase)
 
-        # Dijital QPSK öbek: rastgele 4 fazlı semboller, RRC darbe ile
-        # şekillendirilir → kompakt bant. Sembol geçişlerindeki ani faz
-        # sıçramaları sınıflandırmada "dijital" imzası verir.
+        # Dijital QPSK öbek: RRC şekilli rastgele 4-PSK semboller.
         f_qpsk = _QPSK_OFFSET_FRAC * nyq
         sps = max(int(round(1.0 / _QPSK_SYMRATE_FRAC)), 1)  # örnek/sembol
         n_sym = n // sps + _QPSK_RRC_SPAN + 1
@@ -165,17 +215,58 @@ class MockSDR(SDRBase):
         shaped = np.convolve(upsampled, taps, mode="same")[:n]
         iq += _QPSK_AMPLITUDE * shaped * np.exp(2j * np.pi * f_qpsk * t)
 
-        # AWGN
-        noise = self._rng.standard_normal(n) + 1j * self._rng.standard_normal(n)
-        iq += _NOISE_SIGMA * noise
-
         iq *= gain_lin
-
+        # Yönlü anten kazancı (sinyale uygulanır; gürültü ayrıca eklenir).
+        iq *= self._antenna_gain()
         # Faz sürekliliği için örnek sayacını ilerlet.
         self._phase += n
+        return iq
 
-        # Gerçekçi throughput taklidi: blok süresinin bir kısmı kadar bekle.
-        # Tam blok süresi beklemek FPS'i düşürür; yarısı yeterli gerçekçilik.
-        time.sleep(min(0.5 * n / rate, 0.02))
+    def _noise(self, n: int) -> np.ndarray:
+        """``n`` örneklik karmaşık AWGN üret."""
+        z = self._rng.standard_normal(n) + 1j * self._rng.standard_normal(n)
+        return _NOISE_SIGMA * z
 
+    def read_samples(self, n: int) -> np.ndarray:
+        """``n`` örneklik sentetik IQ bloğu üret (tek kanal = kanal 0).
+
+        Gerçek donanım okuma süresini taklit etmek için kısa bir uyku eklenir,
+        böylece worker CPU'yu %100 meşgul etmez ve FPS gerçekçi kalır.
+        """
+        if not self._opened:
+            raise RuntimeError("MockSDR açık değil; önce open() çağırın.")
+
+        iq = self._generate_clean(n) + self._noise(n)
+        time.sleep(min(0.5 * n / self._rate, 0.02))
         return iq.astype(np.complex64)
+
+    def read_samples_dual(self, n: int) -> tuple[np.ndarray, np.ndarray]:
+        """İki koherent kanal üret: rx1 = exp(j·Δφ)·rx0(n−k) + bağımsız gürültü.
+
+        Kanal 0 baskın sinyaldir. Kanal 1, bilinen bir örnek kayması (k) ve faz
+        farkı (Δφ) ile üretilir; bu fark DONANIMSAL uyumsuzluk + (referans modu
+        kapalıyken) GEOMETRİK yön fazını içerir. Bilinen ground-truth sayesinde
+        kalibrasyon ve DoA testlerinde beklenen değerler geri çıkarılabilir.
+
+        Her kanala bağımsız AWGN eklenir (korelasyon ground-truth'u bozmaz ama
+        gerçekçi gürültü tabanı sağlar).
+        """
+        if not self._opened:
+            raise RuntimeError("MockSDR açık değil; önce open() çağırın.")
+
+        clean = self._generate_clean(n)
+
+        # Toplam faz farkı: donanımsal + (referans değilse) geometrik yön fazı.
+        phi = self._df_phase_offset_rad
+        if not self._cal_reference:
+            lam = _C / self._freq
+            sin_theta = np.sin(np.radians(self._df_true_doa_deg))
+            phi += 2.0 * np.pi * self._df_baseline_m * sin_theta / lam
+
+        rx0 = clean + self._noise(n)
+        rx1 = (
+            np.roll(clean, self._df_sample_shift) * np.exp(1j * phi)
+            + self._noise(n)
+        )
+        time.sleep(min(0.5 * n / self._rate, 0.02))
+        return rx0.astype(np.complex64), rx1.astype(np.complex64)
