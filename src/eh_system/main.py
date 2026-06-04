@@ -86,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:
     motor_cfg = cfg.get("motor", {})
     scan_cfg = cfg.get("scan", {})
     mock_cfg = cfg.get("mock", {})
+    tx_cfg = cfg.get("tx", {})
+    limits_cfg = cfg.get("limits", {})
 
     sdr = _build_sdr(args.mock, sdr_cfg, doa_cfg, mock_cfg)
     motor = _build_motor(args.mock, motor_cfg)
@@ -113,6 +115,8 @@ def main(argv: list[str] | None = None) -> int:
         scan_start_deg=float(scan_cfg.get("start_deg", 0.0)),
         scan_stop_deg=float(scan_cfg.get("stop_deg", 180.0)),
         scan_step_deg=float(scan_cfg.get("step_deg", 10.0)),
+        power_limit_db=float(limits_cfg.get("tx_power_max_db", 0.0)),
+        tx_gain_db=float(tx_cfg.get("gain_db", 40.0)),
     )
     win.show()
     win.start()

@@ -55,6 +55,11 @@ df_phase_offset_rad = 0.6
 # Baskın kaynağın gerçek geliş açısı (derece) — DoA'nın geri çıkaracağı değer.
 df_true_doa_deg = 25.0
 
+[tx]
+# TX (ET) donanım kazancı (dB) — gerçek LimeSDR TX path.
+gain_db = 40.0
+
 [limits]
-# Yazılımsal TX güç üst limiti (dB) — bu iskelette kullanılmaz, ileride ET için
+# Yazılımsal TX güç üst limiti (dB) — ET karıştırma/aldatma gücü bunu AŞAMAZ.
+# UI güç ayarı bu değerle sınırlanır; TXWorker çıkışı bu seviyede kırpılır.
 tx_power_max_db = 0.0

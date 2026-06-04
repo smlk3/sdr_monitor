@@ -24,14 +24,19 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from ..hal.motor import MockMotor, MotorBase
+from ..hal.rf_switch import RFSwitch
 from ..hal.sdr_base import SDRBase
 from ..workers.scan_worker import ScanWorker
 from ..workers.sdr_worker import SDRWorker
+from ..workers.tx_worker import TXWorker
+from .widgets.deception_tab import DeceptionTab
+from .widgets.jamming_tab import JammingTab
 from .widgets.polar import PolarPlot
 
 # Seçilebilir örnekleme hızları (Hz). Sürdürülebilir IBW ~30 MHz (CLAUDE.md).
@@ -82,6 +87,8 @@ class MainWindow(QMainWindow):
         scan_start_deg: float = _DF_START_DEG,
         scan_stop_deg: float = _DF_STOP_DEG,
         scan_step_deg: float = _DF_STEP_DEG,
+        power_limit_db: float = 0.0,
+        tx_gain_db: float = 40.0,
     ) -> None:
         super().__init__()
         self.setWindowTitle("EH Sistemi — Spektrum Analizör + DF")
@@ -112,6 +119,17 @@ class MainWindow(QMainWindow):
         # Açı-güç haritası birikimi (tarama sırasında).
         self._scan_angles: list[float] = []
         self._scan_powers: list[float] = []
+
+        # --- ET (Elektronik Taarruz) durumu ---
+        self._power_limit_db = float(power_limit_db)
+        self._tx_gain_db = float(tx_gain_db)
+        # RF switch: zorunlu RX→TX sıralamasını dayatır (donanım callback'leri
+        # mock'ta no-op; gerçek donanımda GPIO/PA bağlanır). RX worker yaşam
+        # döngüsü UI thread'inde yönetilir (cross-thread kontrol yok).
+        self._rf_switch = RFSwitch()
+        self._tx_worker: TXWorker | None = None
+        self._resume_live_after_tx = False
+        self._tx_emergency = False
 
         # --- Worker ---
         self._worker = SDRWorker(
@@ -145,9 +163,10 @@ class MainWindow(QMainWindow):
         num_guard: int,
         pfa_exp: int,
     ) -> None:
-        central = QWidget()
-        self.setCentralWidget(central)
-        root = QVBoxLayout(central)
+        # Elektronik Destek (ED) sekmesi içeriği bu widget'a kurulur; ET
+        # sekmeleri sonradan eklenir ve hepsi bir QTabWidget'a yerleştirilir.
+        ed_widget = QWidget()
+        root = QVBoxLayout(ed_widget)
 
         # Kontrol çubuğu
         controls = QHBoxLayout()
@@ -328,7 +347,21 @@ class MainWindow(QMainWindow):
         self._status.addPermanentWidget(self._fps_label)
         self._status.addPermanentWidget(self._ovf_label)
 
-        self.resize(1000, 720)
+        # Sekmeler: ED + Karıştırma + Aldatma.
+        self._tabs = QTabWidget()
+        self._tabs.addTab(ed_widget, "Elektronik Destek (ED)")
+        self._jamming_tab = JammingTab(sample_rate, self._power_limit_db)
+        self._deception_tab = DeceptionTab(self._power_limit_db)
+        self._tabs.addTab(self._jamming_tab, "Karıştırma (ET)")
+        self._tabs.addTab(self._deception_tab, "Aldatma (ET)")
+        self.setCentralWidget(self._tabs)
+
+        for tab in (self._jamming_tab, self._deception_tab):
+            tab.tx_start_requested.connect(self._on_tx_start)
+            tab.tx_stop_requested.connect(self._on_tx_stop)
+            tab.emergency_requested.connect(self._on_emergency)
+
+        self.resize(1100, 760)
 
     def _init_waterfall(self, fft_size: int) -> None:
         """Dairesel waterfall tamponunu (satır x fft) -120 dB ile başlat."""
@@ -497,6 +530,82 @@ class MainWindow(QMainWindow):
             self._resume_live = False
             self._worker.start()
 
+    # --- ET (Elektronik Taarruz): TX orkestrasyonu ---
+
+    def _on_tx_start(
+        self, tx_freq: float, waveform: object, power_db: float, sample_rate: float
+    ) -> None:
+        """Yayını başlat: RX worker'larını durdur, SDR'ı aç, TXWorker'ı kur.
+
+        Emniyet: RF switch sıralaması (RX durdur → switch → guard → TX) TXWorker
+        içinde rf_switch ile dayatılır; güç yazılımsal limitle kırpılır.
+        """
+        if self._tx_worker is not None and self._tx_worker.isRunning():
+            return  # zaten yayında
+
+        # RX paylaşımı: canlı/scan worker'larını UI thread'inde durdur.
+        self._resume_live_after_tx = self._worker.isRunning()
+        if self._worker.isRunning():
+            self._worker.stop()
+        if self._scan_worker is not None and self._scan_worker.isRunning():
+            self._scan_worker.stop()
+
+        # Önceki bir acil durdurdan kalmış olabilir → switch'i güvenle RX'e al.
+        self._rf_switch.force_rx_active()
+        self._tx_emergency = False
+        try:
+            self._sdr.open()  # RX worker kapatmış olabilir; TX için yeniden aç
+        except Exception as exc:
+            self._status.showMessage(f"SDR açılamadı: {exc}", 5000)
+            return
+
+        worker = TXWorker(
+            self._sdr,
+            self._rf_switch,
+            tx_freq=tx_freq,
+            sample_rate=sample_rate,
+            tx_gain_db=self._tx_gain_db,
+            power_limit_db=self._power_limit_db,
+        )
+        worker.set_waveform(waveform)
+        worker.set_power_db(power_db)
+        worker.status_changed.connect(self._on_status)
+        worker.error_occurred.connect(self._on_error)
+        worker.power_capped.connect(self._on_power_capped)
+        worker.finished.connect(self._on_tx_finished)
+        self._tx_worker = worker
+        worker.start()
+
+    def _on_tx_stop(self) -> None:
+        """Yayını normal durdur (güvenli TX→RX dizisi)."""
+        if self._tx_worker is not None and self._tx_worker.isRunning():
+            self._tx_worker.stop()
+
+    def _on_emergency(self) -> None:
+        """ACİL DURDUR: TX kes + motor durdur (<500 ms). Otomatik RX'e dönmez."""
+        self._tx_emergency = True
+        if self._tx_worker is not None and self._tx_worker.isRunning():
+            self._tx_worker.emergency_stop()
+        try:
+            self._motor.stop()
+        except Exception as exc:
+            self._status.showMessage(f"Motor durdurma hatası: {exc}", 5000)
+        self._status.showMessage("ACİL DURDUR uygulandı.", 5000)
+
+    def _on_power_capped(self, capped_db: float) -> None:
+        """İstenen TX gücü limiti aştı → kırpıldı bilgisi."""
+        self._status.showMessage(
+            f"TX gücü yazılımsal limite kırpıldı: {capped_db:.1f} dB", 5000
+        )
+
+    def _on_tx_finished(self) -> None:
+        """TXWorker bitti: sekmeleri senkronla, (acil değilse) canlıyı sürdür."""
+        self._jamming_tab.notify_tx_stopped()
+        self._deception_tab.notify_tx_stopped()
+        if not self._tx_emergency and self._resume_live_after_tx:
+            self._resume_live_after_tx = False
+            self._worker.start()
+
     # --- Worker -> UI slot'ları ---
 
     def _on_spectrum(self, freqs: np.ndarray, psd_db: np.ndarray) -> None:
@@ -582,7 +691,10 @@ class MainWindow(QMainWindow):
     # --- Kapanış ---
 
     def closeEvent(self, event: object) -> None:  # noqa: N802 (Qt API)
-        """Pencere kapanırken tüm worker'ları temiz durdur."""
+        """Pencere kapanırken tüm worker'ları temiz durdur (TX dahil)."""
+        if self._tx_worker is not None and self._tx_worker.isRunning():
+            self._tx_worker.emergency_stop()
+            self._tx_worker.wait(1000)
         if self._scan_worker is not None and self._scan_worker.isRunning():
             self._scan_worker.stop()
         self._worker.stop()
