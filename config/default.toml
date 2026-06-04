@@ -1,0 +1,36 @@
+# EH Sistemi varsayılan yapılandırması
+# Tüm değerler MockSDR ve gerçek LimeSDR için ortak başlangıç noktasıdır.
+
+[sdr]
+# Varsayılan merkez frekansı (Hz) — 433 MHz ISM bandı
+frequency = 433.0e6
+# Örnekleme hızı (Hz)
+sample_rate = 10.0e6
+# RX kazancı (dB)
+gain = 30.0
+# Aktif RX kanalı
+channel = 0
+# Okuma başına örnek sayısı (FFT boyutuna göre worker ayarlar)
+read_size = 4096
+
+[dsp]
+# FFT boyutu (örnek)
+fft_size = 1024
+# Pencere tipi: "hann" | "blackman-harris"
+window = "hann"
+# CA-CFAR: her yandaki eğitim hücresi sayısı
+cfar_num_train = 16
+# CA-CFAR: her yandaki koruma (guard) hücresi sayısı
+cfar_num_guard = 4
+# CA-CFAR: yanlış alarm olasılığı üssü → Pfa = 10^(-cfar_pfa_exp)
+cfar_pfa_exp = 4
+
+[ui]
+# Waterfall satır (zaman dilimi) sayısı
+waterfall_rows = 200
+# Spektrum güncelleme hedefi (FPS) — bilgilendirme amaçlı
+target_fps = 30
+
+[limits]
+# Yazılımsal TX güç üst limiti (dB) — bu iskelette kullanılmaz, ileride ET için
+tx_power_max_db = 0.0
