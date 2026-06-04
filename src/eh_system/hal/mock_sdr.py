@@ -118,6 +118,11 @@ class MockSDR(SDRBase):
         # Motor (anten) yönelim açısı (derece) — tarama sırasında worker ayarlar.
         # None iken yönlü kazanç uygulanmaz (gücün 1.0; canlı spektrum etkilenmez).
         self._pointing_deg: float | None = None
+        # TX (ET) taklidi durumu: yayın yok, yalnız sayaç/son blok tutulur.
+        self._tx_active = False
+        self._tx_freq = 0.0
+        self._tx_sample_count = 0
+        self._last_tx_iq: np.ndarray | None = None
 
     # --- Yaşam döngüsü ---
 
@@ -270,3 +275,36 @@ class MockSDR(SDRBase):
         )
         time.sleep(min(0.5 * n / self._rate, 0.02))
         return rx0.astype(np.complex64), rx1.astype(np.complex64)
+
+    # --- TX (ET) taklidi: gerçek yayın yok; yalnız durum/sayaç tutulur ---
+
+    def start_tx(self, freq_hz: float, sample_rate: float, gain_db: float) -> None:
+        """TX akışını (taklit) başlat."""
+        if not self._opened:
+            raise RuntimeError("MockSDR açık değil; önce open() çağırın.")
+        self._tx_freq = float(freq_hz)
+        self._rate = float(sample_rate)
+        self._tx_active = True
+        self._tx_sample_count = 0
+
+    def write_samples(self, iq: np.ndarray) -> int:
+        """``iq`` bloğunu (taklit) yaz: sayacı ilerlet, son bloğu sakla.
+
+        Gerçek donanım throughput'unu taklit etmek için kısa bir uyku eklenir.
+        """
+        if not self._tx_active:
+            raise RuntimeError("TX başlatılmadı; önce start_tx() çağırın.")
+        n = int(iq.shape[0])
+        self._tx_sample_count += n
+        self._last_tx_iq = np.asarray(iq, dtype=np.complex64).copy()
+        time.sleep(min(0.5 * n / self._rate, 0.02))
+        return n
+
+    def stop_tx(self) -> None:
+        """TX akışını (taklit) durdur (idempotent)."""
+        self._tx_active = False
+
+    @property
+    def tx_sample_count(self) -> int:
+        """Şu ana dek (taklit) yazılan toplam TX örnek sayısı."""
+        return self._tx_sample_count

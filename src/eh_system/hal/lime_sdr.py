@@ -18,13 +18,18 @@ from .sdr_base import SDRBase
 # SoapySDR'ı yumuşak (soft) içe aktar: yoksa modül yine de yüklenir.
 try:
     import SoapySDR  # type: ignore
-    from SoapySDR import SOAPY_SDR_CS16, SOAPY_SDR_RX  # type: ignore
+    from SoapySDR import (  # type: ignore
+        SOAPY_SDR_CS16,
+        SOAPY_SDR_RX,
+        SOAPY_SDR_TX,
+    )
 
     _SOAPY_IMPORT_ERROR: Exception | None = None
 except Exception as exc:  # pragma: no cover - ortam bağımlı
     SoapySDR = None  # type: ignore
     SOAPY_SDR_CS16 = None  # type: ignore
     SOAPY_SDR_RX = None  # type: ignore
+    SOAPY_SDR_TX = None  # type: ignore
     _SOAPY_IMPORT_ERROR = exc
 
 # CS16 tam ölçek: int16 aralığı [-32768, 32767]. Normalize için 2^15.
@@ -52,6 +57,9 @@ class LimeSDR(SDRBase):
         # İki kanallı (DF) akış ve tamponları (yön bulma için, tembel kurulur).
         self._dual_stream = None
         self._buf_dual: list[np.ndarray] | None = None
+        # TX (ET) akışı (tembel kurulur).
+        self._tx_stream = None
+        self._tx_channel = 0
 
     # --- Yaşam döngüsü ---
 
@@ -86,13 +94,14 @@ class LimeSDR(SDRBase):
         """Akışı durdur ve cihazı serbest bırak (idempotent)."""
         try:
             if self._dev is not None:
-                for stream in (self._stream, self._dual_stream):
+                for stream in (self._stream, self._dual_stream, self._tx_stream):
                     if stream is not None:
                         self._dev.deactivateStream(stream)
                         self._dev.closeStream(stream)
         finally:
             self._stream = None
             self._dual_stream = None
+            self._tx_stream = None
             self._dev = None
             self._buf = None
             self._buf_dual = None
@@ -203,3 +212,43 @@ class LimeSDR(SDRBase):
             q = b[1 : 2 * n : 2].astype(np.float32)
             out.append(((i + 1j * q) / _CS16_FULL_SCALE).astype(np.complex64))
         return out[0], out[1]
+
+    # --- TX (ET) ---
+
+    def start_tx(self, freq_hz: float, sample_rate: float, gain_db: float) -> None:
+        """TX kanalını yapılandır ve CS16 TX akışını başlat.
+
+        DC offset tuzağı (CLAUDE.md): TX hedefini tam merkeze değil ~200 kHz
+        kaydırarak ayarla. Bu kaydırma çağıran (tx_worker) tarafından LO/baseband
+        seçimiyle yapılır; burada yalnız istenen LO frekansı uygulanır.
+        """
+        if self._dev is None:
+            raise RuntimeError("LimeSDR açık değil; önce open() çağırın.")
+        ch = self._tx_channel
+        self._dev.setSampleRate(SOAPY_SDR_TX, ch, float(sample_rate))
+        self._dev.setFrequency(SOAPY_SDR_TX, ch, float(freq_hz))
+        self._dev.setGain(SOAPY_SDR_TX, ch, float(gain_db))
+        self._tx_stream = self._dev.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CS16, [ch])
+        self._dev.activateStream(self._tx_stream)
+
+    def write_samples(self, iq: np.ndarray) -> int:
+        """``iq`` (complex64, [-1,1]) bloğunu CS16'ya çevirip TX akışına yaz."""
+        if self._dev is None or self._tx_stream is None:
+            raise RuntimeError("TX başlatılmadı; önce start_tx() çağırın.")
+        n = int(iq.shape[0])
+        # complex64 [-1,1) → interleaved int16 (I0,Q0,...).
+        buf = np.empty(2 * n, dtype=np.int16)
+        scaled = np.clip(iq, -1.0, 1.0) * (_CS16_FULL_SCALE - 1)
+        buf[0::2] = np.real(scaled).astype(np.int16)
+        buf[1::2] = np.imag(scaled).astype(np.int16)
+        sr = self._dev.writeStream(self._tx_stream, [buf], n, timeoutUs=int(1e6))
+        return int(sr.ret) if sr.ret > 0 else 0
+
+    def stop_tx(self) -> None:
+        """TX akışını durdur ve kapat (idempotent)."""
+        if self._dev is not None and self._tx_stream is not None:
+            try:
+                self._dev.deactivateStream(self._tx_stream)
+                self._dev.closeStream(self._tx_stream)
+            finally:
+                self._tx_stream = None

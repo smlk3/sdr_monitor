@@ -61,6 +61,29 @@ class SDRBase(ABC):
             f"{type(self).__name__} çift kanal (DF) okumayı desteklemiyor."
         )
 
+    # --- TX (Elektronik Taarruz) ---
+    # NOT (emniyet): TX yalnız RF switch sıralaması (RX durdur → switch → guard)
+    # tamamlandıktan sonra ve yazılımsal güç limiti uygulanarak çağrılmalıdır.
+    # Bu metotlar donanımı yalnız sürer; emniyet mantığı rf_switch/tx_worker'da.
+
+    def start_tx(self, freq_hz: float, sample_rate: float, gain_db: float) -> None:
+        """TX akışını başlat. Çift kanal gibi, desteklemeyen SDR hata verir."""
+        raise NotImplementedError(
+            f"{type(self).__name__} TX'i desteklemiyor."
+        )
+
+    def write_samples(self, iq: np.ndarray) -> int:
+        """``iq`` (complex64) bloğunu TX akışına yaz; yazılan örnek sayısı döner."""
+        raise NotImplementedError(
+            f"{type(self).__name__} TX'i desteklemiyor."
+        )
+
+    def stop_tx(self) -> None:
+        """TX akışını durdur (idempotent)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} TX'i desteklemiyor."
+        )
+
     # --- Bilgi erişimcileri (alt sınıflar geçerli değerleri tutar) ---
 
     @property
