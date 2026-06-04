@@ -49,6 +49,9 @@ class LimeSDR(SDRBase):
         self._stream = None
         # CS16 ara tampon: kanal başına 2 int16 (I, Q) → interleaved int16.
         self._buf: np.ndarray | None = None
+        # İki kanallı (DF) akış ve tamponları (yön bulma için, tembel kurulur).
+        self._dual_stream = None
+        self._buf_dual: list[np.ndarray] | None = None
 
     # --- Yaşam döngüsü ---
 
@@ -82,13 +85,17 @@ class LimeSDR(SDRBase):
     def close(self) -> None:
         """Akışı durdur ve cihazı serbest bırak (idempotent)."""
         try:
-            if self._dev is not None and self._stream is not None:
-                self._dev.deactivateStream(self._stream)
-                self._dev.closeStream(self._stream)
+            if self._dev is not None:
+                for stream in (self._stream, self._dual_stream):
+                    if stream is not None:
+                        self._dev.deactivateStream(stream)
+                        self._dev.closeStream(stream)
         finally:
             self._stream = None
+            self._dual_stream = None
             self._dev = None
             self._buf = None
+            self._buf_dual = None
 
     # --- Ayarlar ---
 
@@ -146,3 +153,53 @@ class LimeSDR(SDRBase):
         q = self._buf[1 : 2 * n : 2].astype(np.float32)
         iq = (i + 1j * q) / _CS16_FULL_SCALE
         return iq.astype(np.complex64)
+
+    def _setup_dual(self) -> None:
+        """İki kanallı (RX0+RX1) koherent CS16 akışını tembel kur ve etkinleştir.
+
+        DF için her iki kanal aynı frekans/hız/kazançta yapılandırılır. NOT
+        (donanım): koherent örnekleme için iki RX kanalının aynı LMS7002M
+        içinde ve aynı stream üzerinden ([0, 1]) açılması gerekir.
+        """
+        for ch in (0, 1):
+            self._dev.setSampleRate(SOAPY_SDR_RX, ch, self._rate)
+            self._dev.setFrequency(SOAPY_SDR_RX, ch, self._freq)
+            self._dev.setGain(SOAPY_SDR_RX, ch, self._gain)
+        self._dual_stream = self._dev.setupStream(
+            SOAPY_SDR_RX, SOAPY_SDR_CS16, [0, 1]
+        )
+        self._dev.activateStream(self._dual_stream)
+
+    def read_samples_dual(self, n: int) -> tuple[np.ndarray, np.ndarray]:
+        """İki RX kanalından eş zamanlı ``n`` IQ örneği oku (DF için koherent).
+
+        İki kanallı CS16 akışı ilk çağrıda kurulur. ``readStream`` kanal başına
+        bir tampon bekler; her tampon interleaved int16 (I0,Q0,...) doldurulur.
+        """
+        if self._dev is None:
+            raise RuntimeError("LimeSDR açık değil; önce open() çağırın.")
+        if self._dual_stream is None:
+            self._setup_dual()
+        if self._buf_dual is None or self._buf_dual[0].shape[0] != 2 * n:
+            self._buf_dual = [
+                np.empty(2 * n, dtype=np.int16),
+                np.empty(2 * n, dtype=np.int16),
+            ]
+
+        got = 0
+        while got < n:
+            views = [b[2 * got : 2 * n] for b in self._buf_dual]
+            sr = self._dev.readStream(
+                self._dual_stream, views, n - got, timeoutUs=int(1e6)
+            )
+            if sr.ret > 0:
+                got += sr.ret
+            elif sr.ret < 0:
+                break
+
+        out: list[np.ndarray] = []
+        for b in self._buf_dual:
+            i = b[0 : 2 * n : 2].astype(np.float32)
+            q = b[1 : 2 * n : 2].astype(np.float32)
+            out.append(((i + 1j * q) / _CS16_FULL_SCALE).astype(np.complex64))
+        return out[0], out[1]
